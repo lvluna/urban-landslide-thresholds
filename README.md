@@ -1,4 +1,4 @@
-[![DOI]()
+[![DOI](https://zenodo.org/badge/648647423.svg)](https://zenodo.org/badge/latestdoi/648647423)
 
 # urban-landslide-thresholds
 *Bayesian quantile regression to learn rainfall intensity duration thresholds for shallow landsliding in urban areas globally*
