@@ -1,0 +1,625 @@
+---
+title: "06 - Bayesian Quantile Regression"
+author: "Lisa Luna"
+date: "4/11/2022"
+output: html_document
+---
+
+This notebook uses Bayesian multi-level quantile regression to estimate 10th percentile, 50th percentile, and 90th percentile rainfall intensity-duration thresholds for 26 cities and global mean thresholds across all cities.
+
+Data required: 
+
+Processed data:
+- lsdata_rain.csv
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+#name the run
+nameofrun <- '_20230403_Run_v4'
+```
+
+
+Load packages
+```{r load}
+library(brms)
+library(dplyr)
+library(ggplot2)
+library(tidybayes)
+library(patchwork)
+library(bayesplot)
+library(maps)
+library(ggrepel)
+library(ggmap)
+library(sf)
+library(tidyr)
+library(giscoR)
+```
+
+Read and process landslide points with event rainfall (lsdata_rain.csv)
+
+```{r read data}
+
+lsdata <- read.csv(paste0('lsdata_rain.csv'))
+
+```
+
+Prepare landslide point data for multi-level modeling
+- Get only variables needed (duration, intensity)
+- Log-transform and scale
+
+```{r prep lsdata}
+
+#take the event duration, accumulation, landslide ID, city ID, and city name
+landslides <- lsdata %>%
+              select(lsidx, ID_HDC_G0, city, e_htopk, e_cptopk)
+
+#calculate intensity from cumulative precipitation and duration 
+landslides <- landslides %>% 
+              mutate(e_itopk = e_cptopk/e_htopk)
+
+
+#make city a factor 
+landslides$city <- as.factor(landslides$city)
+
+#take log of duration, intensity, and accumulation, and normalize
+landslides.log <- landslides %>% mutate(across(c(e_htopk, e_cptopk, e_itopk), ~log10(.)))
+landslides.log.scale <- landslides.log %>% mutate(across(c(e_htopk, e_cptopk, e_itopk), ~scale(.)))
+
+#save these values to unscale later
+
+landslides.log.mean <- sapply(landslides.log[,c("e_htopk", "e_cptopk", "e_itopk")], mean, na.rm = TRUE)#
+landslides.log.sd <- sapply(landslides.log[,c("e_htopk", "e_cptopk", "e_itopk")], sd, na.rm = TRUE)
+
+print(paste0("Mean log(duration) = ", landslides.log.mean['e_htopk']))
+
+#output which landslides are used for the model
+
+write.csv(landslides, paste0("landslides_model", nameofrun, '.csv'))
+
+```
+
+Input previously reported slopes and intercepts for I-D thresholds from Guzzetti et al, 2008 and Caine, 1980
+```{r previous studies}
+
+guzzettib0 <- 2.20
+guzzettib1 <- -0.44
+guzzettid <- seq(log10(0.1), log10(1000), length.out = 100)
+caineb0 <- 14.82
+caineb1 <- -0.39
+cained <- seq(log10(0.167), log10(500), length.out = 100)
+
+
+```
+
+How many urban landslides occurred below the prior threshold from Guzzetti et al., 2008?  
+```{r}
+landslides.log$guz_itopk <- log10(guzzettib0) + guzzettib1*landslides.log$e_htopk
+
+landslides.log <- landslides.log %>% mutate(missed_alarm = guz_itopk > e_itopk)
+
+
+ggplot(data = landslides.log) + 
+       geom_point(aes(x = e_htopk, 
+                      y = e_itopk, 
+                      color = missed_alarm),
+                  alpha = 0.7) + 
+       geom_point(aes(x = e_htopk, 
+                      y = guz_itopk), 
+                  color = 'blue')
+
+sum(landslides.log$missed_alarm)
+
+sum(landslides.log$missed_alarm)/nrow(landslides.log)
+
+nrow(landslides.log)
+
+```
+
+Transform Guzzetti et al, 2008 parameter estimates to standardized scale
+
+```{r standardize Guzzetti}
+
+#pick two log(rainfall durations)
+
+ld1 <- 1 #10 hour duration
+ld2 <- 2 #100 hour duration
+
+#what would the guzzetti predicted log(intensity values) be at that duration
+
+li1 <- log10(guzzettib0) + guzzettib1*ld1
+li2 <- log10(guzzettib0) + guzzettib1*ld2
+
+#standardize both of these
+
+ld1z <- (ld1-landslides.log.mean['e_htopk'])/landslides.log.sd['e_htopk']
+ld2z <- (ld2-landslides.log.mean['e_htopk'])/landslides.log.sd['e_htopk']
+
+li1z <- (li1-landslides.log.mean['e_itopk'])/landslides.log.sd['e_itopk']
+li2z <- (li2-landslides.log.mean['e_itopk'])/landslides.log.sd['e_itopk']
+
+#now, recalculate what the slope would be (delta y / delta x)
+
+guzzettib1z <- (li2z - li1z)/(ld2z - ld1z)
+
+#and the intercept (y - mx = b)
+guzzettib0z <- li1z - guzzettib1z*ld1z
+
+
+```
+
+Plot standardized Guzzetti et al 2008 parameter estimates and standardized landslide data to make sure everything looks correct
+```{r plot guzzetti}
+#have a look to make sure everything is correct
+d <- seq(-5,2.5, length.out = 10)
+
+ggplot(data = landslides.log.scale, 
+       aes(x = e_htopk, 
+           y = e_itopk)) + 
+  geom_point() +
+  geom_line(data = tibble(x = d, y = guzzettib0z + guzzettib1z*d), 
+            aes(x, y), 
+            color = 'blue')
+#looks good
+```
+
+Prior predictive check using Guzzetti et al., 2008 as a prior.  Because no uncertainty on these parameter estimates is reported in the paper, we estimate an uncertainty here.
+```{r prior predictive check}
+#priors
+
+N <- 1000 #how many values to draw from the prior?
+b0prior = rstudent_t(N, 3, guzzettib0z, 0.1) # draw values from prior distribution for b0 #degrees of freedom, location, scale
+b1prior = rstudent_t(N, 3, guzzettib1z, 0.1) #draw values from prior distribution for b1
+x <- seq(min(landslides.log.scale['e_htopk']), max(landslides.log.scale['e_htopk']), length.out = 10) #x represents a standardized duration value
+
+#here we do a prior predictive check 
+
+#plots
+
+ggplot(data = tibble(b0prior = b0prior), 
+       aes(x = b0prior)) +
+         geom_density() + 
+        geom_vline(xintercept = guzzettib0z, 
+                   color = "blue") +
+        ggtitle('b0 prior')
+
+ggplot(data = tibble(b0prior = b1prior), 
+       aes(x = b1prior)) +
+         geom_density() + 
+        geom_vline(xintercept = guzzettib1z, 
+                   color = "blue") +
+        ggtitle('b1 prior')
+
+plot(NULL, 
+     xlim = range(x), 
+     ylim = c(-4,4), 
+     xlab = 'standardized log duration', 
+     ylab = 'standardized log intensity', 
+     main = 'Prior predictive check')
+
+for (i in 1:N) curve(b0prior[i] + b1prior[i] * x, 
+                     add = TRUE, 
+                     col = alpha("black", alpha = 0.2))
+          curve(guzzettib0z + guzzettib1z*x, add = TRUE, col = 'blue')
+
+
+
+
+```
+
+Set priors for brms.  Careful - the standardized Guzzetti priors must be input by hand!
+```{r define priors}
+#define priors for class b and class Intercept
+
+
+# guzzetti_priors <- c(prior(student_t(3, guzzettib1z, 0.1), class = "b"), #coefficient of standardized log duration (e_htopk)
+#                   prior(student_t(3, guzzettib0z, 0.1), class = "Intercept")) #intercept (standardized data)
+
+guzzettib1z
+guzzettib0z
+
+
+#CAREFUL!!!!! NEED TO CHECK THE VALUES FOR guzzettib1z and guzzettib0z and add them here by hand
+guzzetti_priors <- c(prior(student_t(3, -0.5602155, 0.1), class = "b"), #coefficient of standardized log duration (e_htopk)
+                  prior(student_t(3, -0.7578805, 0.1), class = "Intercept")) #intercept (standardized data)
+
+```
+
+Bayesian multi-level quantile regression for 10th, 50th, and 90th percentiles.  BRMS calls Stan, which uses Hamiltonian Monte Carlo to estimate the parameters.  The model can be flexibly adjusted to fit other quantiles if desired.
+
+```{r run brms}
+
+#define quantiles
+quantnames <- c("q10", "q50", "q90")
+quants <- c(0.1, 0.5, 0.9)
+
+#create list to save fits for each quantile
+quant.fits <- list()
+
+#loop through quantiles, fitting one model per quantile
+for (i in 1:length(quants)) {
+
+  q <- quants[i]
+  qn <- quantnames[i]
+
+  fit <- brm(bf(e_itopk ~ 1 + e_htopk + (1 + e_htopk|city) ,
+                                  quantile = q),
+                                  data = landslides.log.scale,
+                                  family = asym_laplace(),
+                                  warmup = 1000,
+                                  iter = 4000,
+                                  prior = guzzetti_priors,
+                                  control = list(max_treedepth = 15),
+                                  chains = 4, cores = 4)
+  
+  saveRDS(fit, paste0(qn, "_fit.RDS"))
+  
+  quant.fits[[qn]] <- fit
+
+  print(paste0(q, " is finished"))
+
+}
+
+#save the fits
+
+saveRDS(quant.fits, 'quant_fits.RDS')
+
+#quant.fits <- readRDS('quant_fits.RDS')
+
+```
+
+
+Make trace plots to visually check the chains for mixing and convergence
+
+```{r traceplots}
+
+for (q in quantnames){
+
+print(mcmc_plot(quant.fits[[q]], type = "trace"))
+
+}
+  
+```
+
+Plot Rhat to check for convergence
+
+```{r rhat}
+
+for (q in quantnames){
+
+plot(rhat(quant.fits[[q]])); abline(h = 1.01, lty = 2, col = "red")
+
+}
+
+```
+
+Print summaries to check parameter estimates, ESS, and R-hat
+
+```{r summaries}
+#summary(fit.city.vi.vs.q05.ED)
+
+for (q in quantnames){
+
+print(summary(quant.fits[[q]]))
+
+}
+
+```
+
+
+Extract posterior parameter estimates for each quantile, each group, and the population level parameters 
+
+Create new data (durations) to predict expected intensities for
+```{r newdata}
+#need new data that has the city names and range from min to max of scaled e_htopk
+n <- 10
+ncities <- nlevels(landslides$city)
+epred.d.log.min <- 0
+epred.d.log.max <- max(landslides.log['e_htopk'])
+epred.d.log.min.scaled <- (epred.d.log.min - landslides.log.mean['e_htopk'])/landslides.log.sd['e_htopk']
+epred.d.log.max.scaled <- (epred.d.log.max - landslides.log.mean['e_htopk'])/landslides.log.sd['e_htopk']
+
+
+newdata <- data.frame(city = rep(levels(landslides$city), as.vector(rep(n, ncities))), 
+                      e_htopk = rep(seq(from = epred.d.log.min.scaled, 
+                              to = epred.d.log.max.scaled, length.out = n), ncities))
+
+
+```
+
+
+epred - get posterior expectations at a range of rainfall durations for each city for each quantile
+This step provides estimates for both standardized data and on an unstandardized scale
+
+```{r epred}
+#epred - varying intercepts and varying slopes
+
+#loop for each quantile
+
+for (q in quantnames){
+print(q)
+#posterior expectations for new data
+epred.temp <- newdata  %>%
+              add_epred_draws(quant.fits[[q]], 
+              dpar = "mu", 
+              draws = 500) %>%
+              mutate(mu_unz = mu*landslides.log.sd['e_itopk'] + landslides.log.mean['e_itopk']) %>% mutate(e_htopk_unz = e_htopk*landslides.log.sd['e_htopk'] + landslides.log.mean['e_htopk']) %>% #unstandardize
+              mutate(quantname = q)
+#get epred for grand mean (population level parameters)
+epred.grandmean.temp <- add_epred_draws(quant.fits[[q]], 
+                                        newdata = tibble(e_htopk = seq(from = epred.d.log.min.scaled, 
+                                                              to = epred.d.log.max.scaled, length.out = 10)), 
+                                        dpar = "mu",
+                                        re_formula = NA, 
+                                        ndraws = 500) %>%
+                                        mutate(mu_unz = mu*landslides.log.sd['e_itopk'] + landslides.log.mean['e_itopk']) %>% #re_formula = NA gives population level effects
+     mutate(e_htopk_unz = e_htopk*landslides.log.sd['e_htopk'] + landslides.log.mean['e_htopk']) %>%
+                                        mutate(quantname = q)
+
+print("epred complete")
+if (q == quantnames[1]){
+    epred.city.vi.vs.ID <- epred.temp
+    epred.grandmean.vi.vs.ID <- epred.grandmean.temp
+    print("assignment complete 1")
+} else {
+  
+  epred.city.vi.vs.ID <- bind_rows(epred.city.vi.vs.ID, epred.temp)
+  epred.grandmean.vi.vs.ID <- bind_rows(epred.grandmean.vi.vs.ID, epred.grandmean.temp)
+  print("bind complete >2")  
+}
+
+}
+
+#indicate whether this is a selected city for visualization 
+epred.city.vi.vs.ID <- left_join(epred.city.vi.vs.ID, 
+                                 selected, 
+                                 by = "city")
+
+#add a display name
+epred.city.vi.vs.ID <- left_join(epred.city.vi.vs.ID, 
+                                 displaynames, 
+                                 by = "city")
+
+
+rm(epred.temp)
+
+```
+
+
+Get posterior expectation at a duration of choice just for one city or for the global thresholds
+```{r epred one city}
+
+#posterior expectations for new data
+tibble(city = 'Seattle', e_htopk = (log10(12) - landslides.log.mean['e_htopk'])/landslides.log.sd['e_htopk'])  %>%
+              add_epred_draws(quant.fits[['q50']], 
+              dpar = "mu") %>%
+              mutate(mu_unz = mu*landslides.log.sd['e_itopk'] + landslides.log.mean['e_itopk']) %>% mutate(e_htopk_unz = e_htopk*landslides.log.sd['e_htopk'] + landslides.log.mean['e_htopk']) %>% #unstandardize
+              mutate(quantname = q) %>% 
+              median_hdi(mu_unz, .width = c(0.95)) %>% 
+              mutate(across(mu_unz:.upper, .fns = ~10^(.x))) %>%
+              mutate(minus = mu_unz - .lower, 
+                     plus = .upper - mu_unz)
+
+
+annualmaxima %>% filter(city == 'Seattle' & duration.h. == 12) %>% 
+  mutate(intensity = fill_block_max/duration.h.) %>% 
+  select(intensity) %>% 
+  max()
+
+
+#check global threshold for a quantile and duration of choice
+tibble(e_htopk = (log10(10) - landslides.log.mean['e_htopk'])/landslides.log.sd['e_htopk'])  %>%
+                add_epred_draws(quant.fits[['q10']],
+                                        dpar = "mu",
+                                        re_formula = NA, 
+                                        ndraws = 500) %>%
+                                        mutate(mu_unz = mu*landslides.log.sd['e_itopk'] + landslides.log.mean['e_itopk']) %>% #re_formula = NA gives population level effects
+     mutate(e_htopk_unz = e_htopk*landslides.log.sd['e_htopk'] + landslides.log.mean['e_htopk']) %>%
+                                        mutate(quantname = 'q10') %>%
+                                        median_hdi(mu_unz, .width = c(0.95)) %>% 
+                                        mutate(across(mu_unz:.upper, .fns = ~10^(.x)))
+
+
+
+
+```
+
+
+Posterior parameter estimates for each quantile for each city and for population level parameters
+
+info on unstandardizing parameter estimates
+https://mc-stan.org/docs/2_24/stan-users-guide-2_24.pdf
+
+This step provides parameter estimates on 
+1. the standardized scale (where the intercept (post_int_z) refers to the expected standardized (z-score) log(intensity) at the mean log(duration) across all cities and the slope (post_sl_z) refers to how many standard deviations of increase in log(intensity) we could expect for one standard deviation increase in log(duration)) 
+2. the semi-unstandardized scale, where the intercept (post_int_unz_mean) refers to the expected log(intensity) at the mean log(duration) across all cities
+3. and on the unstandardized scale (where the intercept (post_int_unz_0) refers to the expected log(intensity) at a log(duration) of 0 and the slope (post_sl_unz) refers to how much of a log(intensity) increase we could expect for one unit increase in log(duration)).  
+
+```{r post params}
+#get the posterior draws for the ID model for each quantile (for making forest plots)
+
+for (q in quantnames){
+
+post.city.vi.vs.ID.temp <- quant.fits[[q]] %>% 
+                  spread_draws(b_Intercept, b_e_htopk, `r_city`[city,param])
+
+#extract slope parameter estimate and transform to original scale 
+post.city.vi.vs.ID.slope.temp <- post.city.vi.vs.ID.temp %>%
+                                            filter(param == 'e_htopk') %>%
+                                            select(-b_Intercept) %>% 
+                                            mutate(post_sl_z = b_e_htopk + r_city) %>%
+                                            mutate(post_sl_unz = post_sl_z*(landslides.log.sd['e_itopk']/landslides.log.sd['e_htopk']))
+
+
+#extract intercept parameter estimate (not on original scale yet)
+post.city.vi.vs.ID.intercept.temp <- post.city.vi.vs.ID.temp %>%
+                                            filter(param == 'Intercept') %>%
+                                            select(-b_e_htopk) %>% 
+                                            mutate(post_int_z = b_Intercept + r_city) 
+
+#join the intercepts and slopes back together
+post.city.vi.vs.ID.intercept.temp <- left_join(post.city.vi.vs.ID.intercept.temp, 
+                                          post.city.vi.vs.ID.slope.temp %>% 
+                                            select(-b_e_htopk) %>%
+                                            select(-param) %>%
+                                            select(-r_city),
+                                          by = c(".chain", ".iteration", ".draw", "city"))
+
+#transform intercept back to original scale (intercept at the y axis)
+post.city.vi.vs.ID.intercept.temp <- post.city.vi.vs.ID.intercept.temp %>%
+                                   mutate(post_int_unz_mean = post_int_z*landslides.log.sd['e_itopk'] + landslides.log.mean['e_itopk']) %>%
+                                    mutate(post_int_unz_0 = 
+                                             landslides.log.sd['e_itopk'] * (post_int_z - 
+                                                                            post_sl_z*
+                                                                              (landslides.log.mean['e_htopk']/
+                                                                                 landslides.log.sd['e_htopk']))+
+                                                                              landslides.log.mean['e_itopk']) %>%
+                                    mutate(quantname = q)
+
+#get the grand means
+post.grandmean.vi.vs.ID.temp <- post.city.vi.vs.ID.temp %>%
+                                select(b_Intercept, b_e_htopk) %>%
+                                mutate(b_Intercept_unz_mean = b_Intercept*landslides.log.sd['e_itopk'] + landslides.log.mean['e_itopk']) %>%
+                                mutate(b_Intercept_unz_0 = landslides.log.sd['e_itopk'] * (b_Intercept - 
+                                                                            b_e_htopk*
+                                                                              (landslides.log.mean['e_htopk']/
+                                                                                 landslides.log.sd['e_htopk'])+
+                                                                              landslides.log.mean['e_itopk'])) %>%
+  mutate(b_e_htopk_unz = b_e_htopk*(landslides.log.sd['e_itopk']/landslides.log.sd['e_htopk'])) %>%
+                               mutate(quantname = q)
+                            
+
+
+if (q == quantnames[1]){
+    post.city.vi.vs.ID <- post.city.vi.vs.ID.intercept.temp
+    post.grandmean.vi.vs.ID <- post.grandmean.vi.vs.ID.temp
+    print("assignment complete 1")
+} else {
+  
+  post.city.vi.vs.ID <- bind_rows(post.city.vi.vs.ID, post.city.vi.vs.ID.intercept.temp)
+  post.grandmean.vi.vs.ID <- bind_rows(post.grandmean.vi.vs.ID, post.grandmean.vi.vs.ID.temp)
+  print("bind complete >2")  
+  
+}
+
+}
+
+post.city.vi.vs.ID <- left_join(post.city.vi.vs.ID, 
+                                 selected, 
+                                 by = "city")
+
+post.city.vi.vs.ID <- left_join(post.city.vi.vs.ID, 
+                                 displaynames, 
+                                 by = "city")
+
+
+rm(post.city.vi.vs.ID.intercept.temp, post.city.vi.vs.ID.slope.temp, post.city.vi.vs.ID.temp, post.grandmean.vi.vs.ID.temp)
+
+```
+
+```{r grandmean hdi}
+#Get median hdis of the population level parameters for plotting
+#hdi can at times produce multiple intervals, we want just the minimum and maximum of all of these intervals
+
+post.grandmean.vi.vs.ID.medianhdi.b_Intercept <- post.grandmean.vi.vs.ID %>%
+                                  group_by(quantname) %>%
+                                   median_hdi(b_Intercept, .width = 0.95) %>% 
+                                  group_by(quantname) %>%
+                                  summarize(
+                                    across(matches(".lower"), min),
+                                    across(matches(".upper"), max),
+                                    across(!matches(".lower|.upper"), first)) %>%
+                                  rename(b_Intercept.lower = .lower, b_Intercept.upper = .upper)
+
+post.grandmean.vi.vs.ID.medianhdi.b_Intercept_unz_0 <- post.grandmean.vi.vs.ID %>%
+                                  group_by(quantname) %>%
+                                   median_hdi(b_Intercept_unz_0, .width = 0.95) %>% 
+                                  group_by(quantname) %>%
+                                  summarize(
+                                    across(matches(".lower"), min),
+                                    across(matches(".upper"), max),
+                                    across(!matches(".lower|.upper"), first)) %>%
+                                  rename(b_Intercept_unz_0.lower = .lower, b_Intercept_unz_0.upper = .upper)
+
+post.grandmean.vi.vs.ID.medianhdi.b_Intercept_unz_mean <- post.grandmean.vi.vs.ID %>%
+                                  group_by(quantname) %>%
+                                   median_hdi(b_Intercept_unz_mean, .width = 0.95) %>% 
+                                  group_by(quantname) %>%
+                                  summarize(
+                                    across(matches(".lower"), min),
+                                    across(matches(".upper"), max),
+                                    across(!matches(".lower|.upper"), first)) %>%
+                                  rename(b_Intercept_unz_mean.lower = .lower, b_Intercept_unz_mean.upper = .upper)
+
+post.grandmean.vi.vs.ID.medianhdi.b_e_htopk <- post.grandmean.vi.vs.ID %>%
+                                  group_by(quantname) %>%
+                                   median_hdi(b_e_htopk, .width = 0.95) %>% 
+                                  group_by(quantname) %>%
+                                  summarize(
+                                    across(matches(".lower"), min),
+                                    across(matches(".upper"), max),
+                                    across(!matches(".lower|.upper"), first)) %>%
+                                  rename(b_e_htopk.lower = .lower, b_e_htopk.upper = .upper)
+
+post.grandmean.vi.vs.ID.medianhdi.b_e_htopk_unz <- post.grandmean.vi.vs.ID %>%
+                                  group_by(quantname) %>%
+                                   median_hdi(b_e_htopk_unz, .width = 0.95) %>% 
+                                  group_by(quantname) %>%
+                                  summarize(
+                                    across(matches(".lower"), min),
+                                    across(matches(".upper"), max),
+                                    across(!matches(".lower|.upper"), first)) %>%
+                                  rename(b_e_htopk_unz.lower = .lower, b_e_htopk_unz.upper = .upper)
+
+
+post.grandmean.vi.vs.ID.medianhdi <- post.grandmean.vi.vs.ID.medianhdi.b_Intercept %>% 
+                                      left_join(post.grandmean.vi.vs.ID.medianhdi.b_Intercept_unz_0, 
+                                                by = c('quantname', '.width', '.point', '.interval')) %>% 
+                                       left_join(post.grandmean.vi.vs.ID.medianhdi.b_Intercept_unz_mean , 
+                                                  by = c('quantname', '.width', '.point', '.interval')) %>% 
+                                       left_join(post.grandmean.vi.vs.ID.medianhdi.b_e_htopk, 
+                                                 by = c('quantname', '.width', '.point', '.interval')) %>% 
+                                       left_join(post.grandmean.vi.vs.ID.medianhdi.b_e_htopk_unz, 
+                                                 by = c('quantname', '.width', '.point', '.interval')) #%>% 
+
+rm(post.grandmean.vi.vs.ID.medianhdi.b_Intercept, post.grandmean.vi.vs.ID.medianhdi.b_Intercept_unz_0,
+   post.grandmean.vi.vs.ID.medianhdi.b_Intercept_unz_mean, post.grandmean.vi.vs.ID.medianhdi.b_e_htopk, 
+   post.grandmean.vi.vs.ID.medianhdi.b_e_htopk_unz)
+
+
+
+supp.table.hdi.grandmean <- post.grandmean.vi.vs.ID.medianhdi %>%
+                                                    select(quantname, 
+                                                    b_Intercept_unz_0.lower, 
+                                                    b_Intercept_unz_0, 
+                                                    b_Intercept_unz_0.upper, 
+                                                    b_Intercept_unz_mean.lower, 
+                                                    b_Intercept_unz_mean, 
+                                                    b_Intercept_unz_mean.upper, 
+                                                    b_e_htopk_unz.lower, 
+                                                    b_e_htopk_unz, 
+                                                    b_e_htopk_unz.upper)
+
+
+#get unstandardized intensity at mean duration at +/- and as mm 
+
+hdi.grandmean.plus.minus <- supp.table.hdi.grandmean %>% 
+                       select(b_Intercept_unz_mean.lower, 
+                             b_Intercept_unz_mean, 
+                             b_Intercept_unz_mean.upper) %>% 
+                        mutate(b_Intercept_unz_mean.minus = b_Intercept_unz_mean - b_Intercept_unz_mean.lower) %>%
+                        mutate(b_Intercept_unz_mean.plus = b_Intercept_unz_mean.upper - b_Intercept_unz_mean) %>%
+                        mutate(b_Intercept_unz_mean.unlog = 10^b_Intercept_unz_mean) %>%
+                        mutate(b_Intercept_unz_mean.minus.unlog = 10^b_Intercept_unz_mean - 10^b_Intercept_unz_mean.lower) %>% 
+                        mutate(b_Intercept_unz_mean.plus.unlog = 10^b_Intercept_unz_mean.upper - 10^b_Intercept_unz_mean)
+
+
+```
+
+
+
+
